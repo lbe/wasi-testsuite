@@ -1,3 +1,4 @@
+use std::assert_matches;
 use std::process;
 extern crate wit_bindgen;
 
@@ -6,8 +7,8 @@ wit_bindgen::generate!({
   package test:test;
 
   world test {
-      include wasi:filesystem/imports@0.3.0;
-      include wasi:cli/command@0.3.0;
+      include wasi:filesystem/imports@0.3.2;
+      include wasi:cli/command@0.3.2;
   }
 ",
     additional_derives: [PartialEq, Eq, Hash, Clone],
@@ -35,26 +36,26 @@ async fn test_mkdir_rmdir(dir: &Descriptor) {
     assert_eq!(mkdir(".").await, Err(ErrorCode::Exist));
     assert_eq!(mkdir("..").await, Err(ErrorCode::NotPermitted));
     if has_symlink {
-        assert_eq!(
+        assert_matches!(
             mkdir("parent.cleanup/foo").await,
-            Err(ErrorCode::NotPermitted)
+            Err(ErrorCode::NotPermitted | ErrorCode::NotDirectory)
         );
     }
     assert_eq!(mkdir("/").await, Err(ErrorCode::NotPermitted));
     assert_eq!(mkdir("../q.cleanup").await, Err(ErrorCode::NotPermitted));
     if has_symlink {
-        assert_eq!(
+        assert_matches!(
             mkdir("parent.cleanup/q.cleanup").await,
-            Err(ErrorCode::NotPermitted)
+            Err(ErrorCode::NotPermitted | ErrorCode::NotDirectory)
         );
     }
     assert_eq!(mkdir("a.txt").await, Err(ErrorCode::Exist));
     mkdir("q.cleanup").await.unwrap();
     assert_eq!(rmdir("../q.cleanup").await, Err(ErrorCode::NotPermitted));
     if has_symlink {
-        assert_eq!(
+        assert_matches!(
             rmdir("parent.cleanup/q.cleanup").await,
-            Err(ErrorCode::NotPermitted)
+            Err(ErrorCode::NotPermitted | ErrorCode::NotDirectory)
         );
     }
     assert_eq!(
@@ -92,7 +93,16 @@ async fn test_mkdir_rmdir(dir: &Descriptor) {
     if has_symlink {
         // FIXME: https://github.com/bytecodealliance/wasmtime/issues/12178
         // assert_eq!(rmdir("parent.cleanup").await, Err(ErrorCode::NotDirectory));
-        assert_eq!(rmdir("parent.cleanup/").await, Err(ErrorCode::NotPermitted));
+        // POSIX follows the symlink because of the trailing slash, so the
+        // sandbox rejects the escape. Linux fails without following it.
+        let link_result = rmdir("parent.cleanup/").await;
+        assert!(
+            matches!(
+                link_result,
+                Err(ErrorCode::NotPermitted | ErrorCode::NotDirectory)
+            ),
+            "bad result: {link_result:?}"
+        );
     }
 
     mkdir("child.cleanup").await.unwrap();

@@ -1,14 +1,25 @@
 """Download rules for WASI runtime binaries used by the test suite."""
 
+load("@prelude//utils:expect.bzl", "expect")
 load("@wasmono//toolchains/wasm:node.bzl", "NodeInfo")
 load("@wasmono//:defs.bzl", "host_arch", "host_os")
-load(":releases.bzl", "WAMR_RELEASES", "WASMEDGE_RELEASES", "WASMTIME_RELEASES", "WAZERO_RELEASES")
+load(
+    ":releases.bzl",
+    "JBANG_RELEASES",
+    "JDK_RELEASES",
+    "WAMR_RELEASES",
+    "WASMEDGE_RELEASES",
+    "WASMTIME_RELEASES",
+    "WAZERO_RELEASES",
+)
 
-DEFAULT_JCO_VERSION = "1.24.1"
-DEFAULT_NODE_VERSION = "24.16.0"
-DEFAULT_WAMR_VERSION = "2.4.4"
-DEFAULT_WASMEDGE_VERSION = "0.17.0"
-DEFAULT_WASMTIME_VERSION = "45.0.0"
+DEFAULT_JBANG_VERSION = "0.142.0"
+DEFAULT_JCO_VERSION = "1.35.0"
+DEFAULT_JDK_VERSION = "21.0.13+9"
+DEFAULT_NODE_VERSION = "26.8.2"
+DEFAULT_WAMR_VERSION = "2.4.5"
+DEFAULT_WASMEDGE_VERSION = "0.17.1"
+DEFAULT_WASMTIME_VERSION = "49.0.3"
 DEFAULT_WAZERO_VERSION = "1.12.0"
 
 def _runtime_platform() -> str:
@@ -16,24 +27,28 @@ def _runtime_platform() -> str:
 
 def _runtime_release(releases, runtime_name: str, version: str, target_compatible_with = []):
     platform = _runtime_platform()
-    if version not in releases:
-        fail("Unknown {} version '{}'. Available: {}".format(
-            runtime_name,
-            version,
-            ", ".join(releases.keys()),
-        ))
+    expect(
+        version in releases,
+        "Unknown {} version '{}'. Available: {}",
+        runtime_name,
+        version,
+        ", ".join(releases.keys()),
+    )
 
     release = releases[version]
+    if platform not in release and "default" in release:
+        return release["default"]
     if platform not in release and target_compatible_with:
         for fallback in release.values():
             return fallback
 
-    if platform not in release:
-        fail("No {} release for platform '{}'. Available: {}".format(
-            runtime_name,
-            platform,
-            ", ".join(release.keys()),
-        ))
+    expect(
+        platform in release,
+        "No {} release for platform '{}'. Available: {}",
+        runtime_name,
+        platform,
+        ", ".join(release.keys()),
+    )
     return release[platform]
 
 def _runtime_distribution_impl(ctx: AnalysisContext) -> list[Provider]:
@@ -72,12 +87,11 @@ def _jco_runtime_command_impl(ctx: AnalysisContext) -> list[Provider]:
     jco_workspace = ctx.attrs.jco[DefaultInfo].default_outputs[0]
     jco_js = cmd_args(
         jco_workspace,
-        format = "{}/node_modules/@bytecodealliance/jco/src/jco.js",
+        format = "{}/node_modules/@bytecodealliance/jco/dist/jco.js",
     )
 
     run = cmd_args(
         node_info.node,
-        "--experimental-wasm-jspi",
         ctx.attrs.runner,
         "--jco",
         jco_js,
@@ -118,12 +132,72 @@ def jco_runtime_command(
         **kwargs
     )
 
+def _endive_runtime_command_impl(ctx: AnalysisContext) -> list[Provider]:
+    java = ctx.attrs.jdk[RunInfo]
+    jar = ctx.actions.declare_output("endive-runner.jar")
+    ctx.actions.run(
+        cmd_args(
+            ctx.attrs.jbang[RunInfo],
+            "--quiet",
+            "export",
+            "fatjar",
+            "--jdk-providers=javahome",
+            "--force",
+            "--output",
+            jar.as_output(),
+            ctx.attrs.runner,
+            hidden = java,
+        ),
+        # JAVA_HOME is the pinned JDK root, two levels above `bin/java`.
+        env = {"JAVA_HOME": cmd_args(ctx.attrs.jdk[DefaultInfo].default_outputs[0], parent = 2)},
+        category = "jbang_export",
+        # jbang resolves the endive jars from Maven Central.
+        local_only = True,
+    )
+
+    return [
+        DefaultInfo(default_output = jar),
+        RunInfo(args = cmd_args(java, "-jar", jar)),
+    ]
+
+_endive_runtime_command = rule(
+    impl = _endive_runtime_command_impl,
+    attrs = {
+        "jbang": attrs.exec_dep(providers = [RunInfo]),
+        "jdk": attrs.dep(providers = [RunInfo]),
+        "runner": attrs.source(),
+    },
+)
+
+def endive_runtime_command(
+        name: str,
+        jbang: str,
+        jdk: str,
+        runner: str,
+        target_compatible_with = [],
+        visibility = None):
+    """Build the endive jbang runner into a fat jar and run it on the pinned JDK."""
+    kwargs = {}
+    if target_compatible_with:
+        kwargs["target_compatible_with"] = target_compatible_with
+    if visibility != None:
+        kwargs["visibility"] = visibility
+
+    _endive_runtime_command(
+        name = name,
+        jbang = jbang,
+        jdk = jdk,
+        runner = runner,
+        **kwargs
+    )
+
 def _download_runtime(
         name: str,
         releases,
         runtime_name: str,
         version: str,
-        target_compatible_with = []):
+        target_compatible_with = [],
+        append_exe: bool = True):
     release = _runtime_release(releases, runtime_name, version, target_compatible_with)
     kwargs = {}
     if target_compatible_with:
@@ -139,7 +213,7 @@ def _download_runtime(
     _runtime_distribution(
         name = name,
         dist = ":" + name + "-archive",
-        binary = release["binary"] + (".exe" if host_os() == "windows" else ""),
+        binary = release["binary"] + (".exe" if append_exe and host_os() == "windows" else ""),
         prefix = release.get("prefix", ""),
         visibility = ["PUBLIC"],
         **kwargs
@@ -169,3 +243,17 @@ def download_wasmedge_runtime(
         target_compatible_with = []):
     """Download a prebuilt WasmEdge runtime."""
     _download_runtime(name, WASMEDGE_RELEASES, "wasmedge", version, target_compatible_with)
+
+def download_jbang(
+        name: str,
+        version: str = DEFAULT_JBANG_VERSION,
+        target_compatible_with = []):
+    """Download jbang, used to build the endive runner."""
+    _download_runtime(name, JBANG_RELEASES, "jbang", version, target_compatible_with, append_exe = False)
+
+def download_jdk(
+        name: str,
+        version: str = DEFAULT_JDK_VERSION,
+        target_compatible_with = []):
+    """Download a prebuilt JDK, used to build and run the endive runner."""
+    _download_runtime(name, JDK_RELEASES, "jdk", version, target_compatible_with)

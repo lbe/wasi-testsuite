@@ -9,6 +9,7 @@ import pytest
 from wasi_test_runner.test_case import (
     Config, Failure, Result,
     Run, Wait, Read, Write, Connect, Send, Recv, Request, Response, Kill,
+    Endpoint, EndpointMode, EndpointResponse, Server, ServerKind,
     ProtocolType, WasiProposal, WasiWorld, TestCaseValidator
 )
 
@@ -202,6 +203,276 @@ def test_request_from_config() -> None:
     assert req.method == "POST"
     assert req.path == "/"
     assert req.response == Response(status=200, headers={}, body="hey")
+    assert req.headers == {}
+    assert req.body == ""
+
+
+def test_request_from_config_with_body_and_headers() -> None:
+    req = Request.from_config({
+        "method": "POST",
+        "path": "/echo",
+        "headers": {"x-echo": "ping"},
+        "body": "hello",
+        "response": {"status": 200, "body": "hello"},
+    })
+    assert req.method == "POST"
+    assert req.path == "/echo"
+    assert req.headers == {"x-echo": "ping"}
+    assert req.body == "hello"
+    assert req.response == Response(status=200, headers={}, body="hello")
+
+
+def test_request_from_config_rejects_non_dict_headers() -> None:
+    with pytest.raises(ValueError):
+        Request.from_config({"headers": "not-a-dict", "response": {}})
+
+
+def test_request_from_config_rejects_non_str_body() -> None:
+    with pytest.raises(ValueError):
+        Request.from_config({"body": 123, "response": {}})
+
+
+def test_endpoint_response_from_config_str_shorthand() -> None:
+    response = EndpointResponse.from_config("hello")
+
+    assert response.status == 200
+    assert response.headers == {}
+    assert response.body == "hello"
+
+
+def test_endpoint_response_from_config_object() -> None:
+    response = EndpointResponse.from_config({
+        "status": 404,
+        "headers": {"content-type": "text/plain"},
+        "body": "nope",
+    })
+
+    assert response.status == 404
+    assert response.headers == {"content-type": "text/plain"}
+    assert response.body == "nope"
+
+
+def test_endpoint_response_from_config_defaults_to_unchunked() -> None:
+    response = EndpointResponse.from_config({"body": "hello"})
+
+    assert response.chunks is None
+    assert response.trailers == {}
+
+
+def test_endpoint_response_from_config_chunks_and_trailers() -> None:
+    response = EndpointResponse.from_config({
+        "chunks": ["one", "two"],
+        "trailers": {"x-checksum": "abc"},
+    })
+
+    assert response.chunks == ["one", "two"]
+    assert response.trailers == {"x-checksum": "abc"}
+    assert response.body == ""
+
+
+def test_endpoint_response_from_config_rejects_non_list_chunks() -> None:
+    with pytest.raises(ValueError, match="chunks should be a list of str"):
+        EndpointResponse.from_config({"chunks": "one"})
+
+
+def test_endpoint_response_from_config_rejects_non_str_chunk() -> None:
+    with pytest.raises(ValueError, match="chunks should be a list of str"):
+        EndpointResponse.from_config({"chunks": ["one", 2]})
+
+
+def test_endpoint_response_from_config_rejects_body_with_chunks() -> None:
+    with pytest.raises(ValueError, match="'body' or 'chunks', not both"):
+        EndpointResponse.from_config({"body": "hello", "chunks": ["one"]})
+
+
+def test_endpoint_response_from_config_rejects_non_str_trailers() -> None:
+    with pytest.raises(ValueError, match="trailers should be an object"):
+        EndpointResponse.from_config({"chunks": ["one"], "trailers": {"a": 1}})
+
+
+def test_endpoint_response_from_config_rejects_trailers_without_chunks() -> None:
+    # HTTP/1.1 can only carry a trailer section in a chunked body.
+    with pytest.raises(ValueError, match="trailers require 'chunks'"):
+        EndpointResponse.from_config({"body": "hi", "trailers": {"a": "b"}})
+
+
+def test_endpoint_response_from_config_rejects_non_str_non_dict() -> None:
+    with pytest.raises(ValueError, match="should be a str or an object"):
+        EndpointResponse.from_config(42)
+
+
+def test_endpoint_response_from_config_rejects_non_int_status() -> None:
+    with pytest.raises(ValueError):
+        EndpointResponse.from_config({"status": "200"})
+
+
+def test_endpoint_from_config_with_defaults() -> None:
+    endpoint = Endpoint.from_config({})
+
+    assert endpoint.method == "GET"
+    assert endpoint.path == "/"
+    assert endpoint.response == EndpointResponse(status=200, headers={}, body="")
+
+
+def test_endpoint_from_config_with_values() -> None:
+    endpoint = Endpoint.from_config({
+        "method": "PUT",
+        "path": "/greet",
+        "response": {"status": 201, "body": "hi"},
+    })
+
+    assert endpoint.method == "PUT"
+    assert endpoint.path == "/greet"
+    assert endpoint.response == EndpointResponse(status=201, headers={}, body="hi")
+
+
+def test_endpoint_from_config_uppercases_method() -> None:
+    endpoint = Endpoint.from_config({"method": "post", "path": "/greet"})
+
+    assert endpoint.method == "POST"
+
+
+def test_endpoint_from_config_rejects_unknown_method() -> None:
+    with pytest.raises(ValueError, match="Unknown endpoint method: TRACE"):
+        Endpoint.from_config({"method": "TRACE", "path": "/greet"})
+
+
+def test_endpoint_from_config_rejects_non_str_method() -> None:
+    with pytest.raises(ValueError, match="method should be a str"):
+        Endpoint.from_config({"method": 1, "path": "/greet"})
+
+
+def test_endpoint_from_config_rejects_non_str_path() -> None:
+    with pytest.raises(ValueError, match="path should be a str"):
+        Endpoint.from_config({"method": "GET", "path": 1})
+
+
+def test_endpoint_from_config_echo_body_mode() -> None:
+    endpoint = Endpoint.from_config(
+        {"method": "POST", "path": "/echo", "mode": "echo-body"})
+
+    assert endpoint.method == "POST"
+    assert endpoint.path == "/echo"
+    assert endpoint.response is None
+    assert endpoint.mode == EndpointMode.ECHO_BODY
+
+
+def test_endpoint_from_config_echo_body_mode_rejects_response() -> None:
+    with pytest.raises(ValueError, match="'echo-body' mode takes no 'response'"):
+        Endpoint.from_config(
+            {"method": "POST", "path": "/echo", "mode": "echo-body", "response": "hi"})
+
+
+def test_endpoint_from_config_echo_path_is_not_special() -> None:
+    # The path is just a path; only `mode` selects behaviour.
+    endpoint = Endpoint.from_config({"method": "POST", "path": "/echo"})
+
+    assert endpoint.mode == EndpointMode.STATIC
+    assert endpoint.response == EndpointResponse(status=200, headers={}, body="")
+
+
+def test_endpoint_from_config_defaults_to_static_mode() -> None:
+    endpoint = Endpoint.from_config({"path": "/greet", "response": "hello"})
+
+    assert endpoint.mode == EndpointMode.STATIC
+    assert endpoint.response == EndpointResponse(status=200, headers={}, body="hello")
+
+
+def test_endpoint_from_config_echo_headers_mode() -> None:
+    endpoint = Endpoint.from_config({"path": "/echo-headers", "mode": "echo-headers"})
+
+    assert endpoint.mode == EndpointMode.ECHO_HEADERS
+    assert endpoint.response is None
+
+
+def test_endpoint_from_config_echo_headers_mode_rejects_response() -> None:
+    with pytest.raises(ValueError, match="'echo-headers' mode takes no 'response'"):
+        Endpoint.from_config({"path": "/echo-headers", "mode": "echo-headers", "response": "hi"})
+
+
+def test_endpoint_from_config_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="Unknown endpoint mode"):
+        Endpoint.from_config({"path": "/greet", "mode": "shout"})
+
+
+def test_server_from_config_defaults_to_listening() -> None:
+    server = Server.from_config(
+        {"name": "main", "endpoints": [{"path": "/greet", "response": "hi"}]})
+
+    assert server.name == "main"
+    assert server.kind == ServerKind.LISTENING
+    assert server.env_var == "HTTP_SERVER_MAIN"
+    assert server.endpoints == [
+        Endpoint(method="GET", path="/greet",
+                 response=EndpointResponse(status=200, headers={}, body="hi"),
+                 mode=EndpointMode.STATIC),
+    ]
+
+
+def test_server_from_config_closed_kind() -> None:
+    server = Server.from_config({"name": "dead", "kind": "closed"})
+
+    assert server.kind == ServerKind.CLOSED
+    assert server.endpoints == []
+    assert server.env_var == "HTTP_SERVER_DEAD"
+
+
+def test_server_from_config_closed_kind_rejects_endpoints() -> None:
+    with pytest.raises(ValueError, match="'closed' takes no 'endpoints'"):
+        Server.from_config({"name": "dead", "kind": "closed", "endpoints": []})
+
+
+@pytest.mark.parametrize("config", [
+    {}, {"name": ""}, {"name": 1}, {"name": "has space"}, {"name": "has-dash"},
+])
+def test_server_from_config_rejects_bad_name(config: dict) -> None:
+    with pytest.raises(ValueError, match="Server name should be"):
+        Server.from_config(config)
+
+
+def test_server_from_config_rejects_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="Unknown server kind"):
+        Server.from_config({"name": "main", "kind": "haunted"})
+
+
+@patch(
+    "builtins.open",
+    new_callable=mock_open,
+    read_data='{"servers": [{"name": "main", "endpoints":'
+              ' [{"method": "post", "path": "/echo", "mode": "echo-body"}]},'
+              ' {"name": "dead", "kind": "closed"}]}',
+)
+def test_new_config_with_servers(_mock_file: Mock) -> None:
+    config = Config.from_file("file")
+
+    assert config.servers == [
+        Server(name="main", kind=ServerKind.LISTENING, endpoints=[
+            Endpoint(method="POST", path="/echo", response=None,
+                     mode=EndpointMode.ECHO_BODY),
+        ]),
+        Server(name="dead", kind=ServerKind.CLOSED, endpoints=[]),
+    ]
+
+
+@patch(
+    "builtins.open",
+    new_callable=mock_open,
+    read_data='{"servers": [{"name": "main"}, {"name": "MAIN"}]}',
+)
+def test_new_config_rejects_duplicate_server_names(_mock_file: Mock) -> None:
+    with pytest.raises(ValueError, match="Duplicate server names"):
+        Config.from_file("file")
+
+
+@patch(
+    "builtins.open",
+    new_callable=mock_open,
+    read_data='{"operations": [{"type": "run"}, {"type": "wait"}]}',
+)
+def test_new_config_without_servers(_mock_file: Mock) -> None:
+    config = Config.from_file("file")
+
+    assert config.servers == []
 
 
 def test_kill_from_config_with_signal() -> None:

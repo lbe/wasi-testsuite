@@ -10,12 +10,21 @@ versions are supported by a WASI runtime and what the version of the
 runtime itself is.
 
 The WASI test runner includes adapters for
+[endive](https://endive.run),
 [pywasm](https://github.com/mohanson/pywasm),
-[wamr](https://bytecodealliance.github.io/wamr.dev/),
+[wamr](https://groups.google.com/g/wamr-dev),
 [wasmedge](https://wasmedge.org), [wasmtime](https://wasmtime.dev),
-[wazero](https://wazero.io), and
-[wizard](https://github.com/titzer/wizard-engine/).  Contributions of
+[wazero](https://wazero.io),
+[wizard](https://github.com/titzer/wizard-engine/), and
+[zwasm](https://github.com/zwasm/zwasm).  Contributions of
 adapters for other runtimes are welcome.
+
+The endive adapter runs [`tools/EndiveRunner.java`](../tools/EndiveRunner.java)
+with [jbang](https://www.jbang.dev), so it needs `jbang` and `java` on the
+`PATH`; set `ENDIVE` to use another launch command.  The Buck targets
+download a pinned jbang and JDK instead.  The runner copies the
+test directory into an in-memory [ZeroFs](https://github.com/roastedroot/zerofs)
+filesystem, the setup endive recommends for WASI.
 
 ## Writing your own adapter
 
@@ -23,7 +32,7 @@ The adapter is a python file that the test runner will load as a module.
 To create a new adapter, we recommend you take a look at
 [`adapters/wasmtime.py`](../adapters/wasmtime.py).  As you can see,
 currently we require that the module define `get_name`, `get_version`,
-and `compute_argv` functions.
+`get_wasi_versions`, `get_wasi_worlds`, and `compute_argv` functions.
 
 We encourage you to submit your adapter upstream: it's not much code and
 probably we can manage to make changes to it if test runner internals

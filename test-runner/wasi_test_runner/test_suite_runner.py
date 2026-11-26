@@ -5,9 +5,11 @@ import re
 import shutil
 import subprocess
 import socket
+import threading
 import time
 
 from datetime import datetime
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import List, NamedTuple, Tuple, Dict, Any, IO
 
@@ -16,6 +18,7 @@ from .runtime_adapter import RuntimeAdapter
 from .test_case import (
     Result, Failure, WasiVersion, Config, Outcome,
     TestCase, TestCaseRunnerBase, TestCaseValidator,
+    Endpoint, EndpointMode, ServerKind, ECHO_HEADER_PREFIX, TRAILER_HEADER_PREFIX,
     # Operation types
     Run, Read, Write, Wait, Send, Recv, Connect, Request, Kill
 )
@@ -34,6 +37,140 @@ class _TestSpec(NamedTuple):
     config: Config
 
 
+class _EndpointServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address: Tuple[str, int], handler: Any) -> None:
+        super().__init__(server_address, handler)
+        self.routes: Dict[Tuple[str, str], Endpoint] = {}
+
+
+class _EndpointRequestHandler(BaseHTTPRequestHandler):
+    # Chunked transfer encoding, and therefore trailers, needs HTTP/1.1.
+    protocol_version = "HTTP/1.1"
+
+    def _close_after_reply(self) -> None:
+        # Ensure one connection per request. `close_connection` is defined by
+        # `BaseHTTPRequestHandler`.
+        # pylint: disable-msg=attribute-defined-outside-init
+        self.close_connection = True
+        self.send_header("Connection", "close")
+
+    def _read_body(self) -> Tuple[bytes, Dict[str, str]]:
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            return self._read_chunked()
+        length = int(self.headers.get("Content-Length") or 0)
+        return (self.rfile.read(length) if length else b""), {}
+
+    def _read_chunked(self) -> Tuple[bytes, Dict[str, str]]:
+        # `http.server` doesn't provide any builtin utilities for trailers.
+        body = b""
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                return body, {}
+            # A chunk size may carry extensions: `4;name=value`.
+            size = int(line.split(b";")[0], 16)
+            if size == 0:
+                break
+            body += self.rfile.read(size)
+            self.rfile.read(2)  # the CRLF terminating each chunk
+        return body, self._read_trailers()
+
+    def _read_trailers(self) -> Dict[str, str]:
+        # Trailers sit after the terminating chunk, spelled like headers and
+        # ended by a blank line.
+        trailers: Dict[str, str] = {}
+        while True:
+            line = self.rfile.readline()
+            if not line or line in (b"\r\n", b"\n"):
+                return trailers
+            name, _, value = line.decode("utf-8").partition(":")
+            trailers[name.strip().lower()] = value.strip()
+
+    def _dispatch(self) -> None:
+        body, trailers = self._read_body()
+        endpoint = self.server.routes.get((self.command, self.path))  # type: ignore[attr-defined]
+        if endpoint is None:
+            self._reply(404, [], b"")
+        elif endpoint.mode is EndpointMode.ECHO_BODY:
+            self._reply(200, [], body)
+        elif endpoint.mode is EndpointMode.ECHO_HEADERS:
+            self._reply(200, self._echoed_headers(trailers), b"")
+        else:
+            response = endpoint.response
+            assert response is not None
+            headers = list(response.headers.items())
+            if response.chunks is None:
+                self._reply(response.status, headers,
+                            response.body.encode("utf-8"))
+            else:
+                self._reply_chunked(
+                    response.status, headers,
+                    [chunk.encode("utf-8") for chunk in response.chunks],
+                    response.trailers)
+
+    def _echoed_headers(self, trailers: Dict[str, str]) -> List[Tuple[str, str]]:
+        echoed = [("x-request-method", self.command),
+                  ("x-request-path", self.path)]
+
+        for name in dict.fromkeys(key.lower() for key in self.headers.keys()):
+            for value in self.headers.get_all(name, []):
+                echoed.append((f"{ECHO_HEADER_PREFIX}{name}", value))
+        for name, value in trailers.items():
+            echoed.append((f"{TRAILER_HEADER_PREFIX}{name}", value))
+        return echoed
+
+    do_GET = _dispatch
+    do_POST = _dispatch
+    do_PUT = _dispatch
+    do_DELETE = _dispatch
+    do_PATCH = _dispatch
+    do_HEAD = _dispatch
+    do_OPTIONS = _dispatch
+
+    def _reply(self, status: int, headers: List[Tuple[str, str]], body: bytes) -> None:
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self._close_after_reply()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _reply_chunked(self, status: int, headers: List[Tuple[str, str]],
+                       chunks: List[bytes], trailers: Dict[str, str]) -> None:
+        # No `Content-Length`: the chunk framing delimits the body instead.
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Transfer-Encoding", "chunked")
+        if trailers:
+            self.send_header("Trailer", ", ".join(trailers))
+        self._close_after_reply()
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        for chunk in chunks:
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+        self.wfile.write(b"0\r\n")
+        for name, value in trailers.items():
+            self.wfile.write(f"{name}: {value}\r\n".encode("utf-8"))  # noqa: E231
+        self.wfile.write(b"\r\n")
+
+    def log_message(self, *_args: Any) -> None:
+        # Avoiding polluting stderr.
+        pass
+
+
+def _reserve_closed_addr() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+    return f"{host}:{port}"  # noqa: E231
+
+
 class TestCaseRunner(TestCaseRunnerBase):
     # pylint: disable-msg=too-many-instance-attributes
     _test_path: str
@@ -45,6 +182,8 @@ class TestCaseRunner(TestCaseRunnerBase):
     _sockets: Dict[str, socket.socket]
     _last_argv: List[str]
     _http_server: str | None
+    _endpoint_servers: List[_EndpointServer]
+    _server_addrs: Dict[str, str]
     _windows_terminated_by_runner: bool
 
     def __init__(self, config: Config, test_path: str, wasi_version: WasiVersion,
@@ -59,7 +198,24 @@ class TestCaseRunner(TestCaseRunnerBase):
         self._sockets = {}
         self._last_argv = []
         self._http_server = None
+        self._endpoint_servers = []
+        self._server_addrs = {}
         self._windows_terminated_by_runner = False
+
+    def _start_servers(self) -> None:
+        if self._server_addrs:
+            return
+        for spec in self.config.servers:
+            if spec.kind is ServerKind.CLOSED:
+                self._server_addrs[spec.env_var] = _reserve_closed_addr()
+                continue
+            server = _EndpointServer(("127.0.0.1", 0), _EndpointRequestHandler)
+            for endpoint in spec.endpoints:
+                server.routes[(endpoint.method, endpoint.path)] = endpoint
+            host, port = server.server_address
+            self._server_addrs[spec.env_var] = f"{host}:{port}"  # noqa: E231
+            self._endpoint_servers.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
 
     def _add_cleanup_dir(self, d: Path) -> None:
         _cleanup_test_output(d)
@@ -113,9 +269,12 @@ class TestCaseRunner(TestCaseRunnerBase):
     def do_run(self, run: Run) -> None:
         if run.root:
             self._add_cleanup_dir(run.root)
+        self._start_servers()
         proposals = self.config.proposals_as_str()
+        wasi_env = dict(run.env)
+        wasi_env.update(self._server_addrs)
         argv = self._runtime.compute_argv(
-            self._test_path, run.args, run.env, run.root, proposals,
+            self._test_path, run.args, wasi_env, run.root, proposals,
             self.config.world, self._wasi_version)
         self._last_argv = argv
         try:
@@ -227,7 +386,13 @@ class TestCaseRunner(TestCaseRunnerBase):
             return
         url = join_http_url(http_server, req.path)
         try:
-            response = requests.request(req.method, url, timeout=5)
+            response = requests.request(
+                req.method,
+                url,
+                headers=req.headers or None,
+                data=req.body.encode("utf-8") if req.body else None,
+                timeout=5,
+            )
         except requests.exceptions.Timeout:
             self.fail_unexpected(f"{req}: Timeout waiting for response")
             return
@@ -275,6 +440,12 @@ class TestCaseRunner(TestCaseRunnerBase):
                 self.fail_unexpected(
                     f"Timeout expired after killing proc {self._proc}")
                 self._proc = None
+
+        for server in self._endpoint_servers:
+            server.shutdown()
+            server.server_close()
+        self._endpoint_servers = []
+        self._server_addrs = {}
 
         for sock in self._sockets.values():
             sock.close()

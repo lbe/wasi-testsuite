@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 import signal
 from pathlib import Path
 from enum import Enum, StrEnum, auto
@@ -7,12 +8,40 @@ from typing import List, NamedTuple, TypeVar, Type, Dict, Any, Set, Optional
 
 # Top level configuration keys
 LEGACY_CONFIG_KEYS = {"args", "root", "env", "exit_code", "stderr", "stdout"}
-CONFIG_KEYS = {"operations", "proposals", "world"}
+CONFIG_KEYS = {"operations", "proposals", "world", "servers"}
 
 
-# Supported operations
+# Supported operations.
 SUPPORTED_OPERATIONS = {"run", "wait", "read", "write", "connect",
                         "send", "recv", "request", "kill"}
+
+# Supported http methods.
+HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+
+# Prefix under which request headers are echoed back as response headers.
+ECHO_HEADER_PREFIX = "x-echo-"
+
+# Prefix under which request trailers are echoed back as response headers.
+TRAILER_HEADER_PREFIX = "x-trailer-"
+
+# Server names travel to the guest inside an environment variable name.
+SERVER_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+class EndpointMode(StrEnum):
+    # Answer with the endpoint's configured `response`.
+    STATIC = 'static'
+    # Echo the request body back verbatim.
+    ECHO_BODY = 'echo-body'
+    # Echo the request line and headers back as response headers.
+    ECHO_HEADERS = 'echo-headers'
+
+
+class ServerKind(StrEnum):
+    # Listening server.
+    LISTENING = 'listening'
+    # An address with nothing listening on it, so connecting is refused.
+    CLOSED = 'closed'
 
 
 class WasiWorld(StrEnum):
@@ -236,20 +265,159 @@ class Request(NamedTuple):
     method: str
     path: str
     response: Response
+    headers: Dict[str, str] = {}
+    body: str = ""
 
     @classmethod
     def from_config(cls: Type[Req], config: Dict[str, Any]) -> Req:
         method = config.get("method", "GET")
         path = config.get("path", "/")
         response = config.get("response", {})
+        headers = config.get("headers", {})
+        body = config.get("body", "")
 
         if not isinstance(method, str):
             raise ValueError("Request method should be a str")
         if not isinstance(path, str):
             raise ValueError("Request path should be a str")
+        if not isinstance(headers, dict):
+            raise ValueError("Request headers should be a dict")
+        for k, v in headers.items():
+            if not isinstance(k, str):
+                raise ValueError("Request header name should be a str")
+            if not isinstance(v, str):
+                raise ValueError("Request header value should be a str")
+        if not isinstance(body, str):
+            raise ValueError("Request body should be a str")
         response = Response.from_config(response)
 
-        return cls(method, path, response)
+        return cls(method, path, response, headers, body)
+
+
+Er = TypeVar("Er", bound="EndpointResponse")
+
+
+class EndpointResponse(NamedTuple):
+    status: int = 200
+    headers: Dict[str, str] = {}
+    body: str = ""
+    chunks: Optional[List[str]] = None
+    trailers: Dict[str, str] = {}
+
+    @classmethod
+    def from_config(cls: Type[Er], config: Any) -> Er:
+        # This is a shorthand for { status: 200, body: config }
+        if isinstance(config, str):
+            return cls(body=config)
+        if not isinstance(config, dict):
+            raise ValueError("Endpoint response should be a str or an object")
+        base = Response.from_config(config)
+
+        chunks = config.get("chunks")
+        if chunks is not None:
+            if not isinstance(chunks, list) or not all(
+                    isinstance(chunk, str) for chunk in chunks):
+                raise ValueError(
+                    "Endpoint response chunks should be a list of str")
+            if "body" in config:
+                raise ValueError(
+                    "Endpoint response takes 'body' or 'chunks', not both")
+
+        trailers = config.get("trailers", {})
+        if not isinstance(trailers, dict) or not all(
+                isinstance(name, str) and isinstance(value, str)
+                for name, value in trailers.items()):
+            raise ValueError(
+                "Endpoint response trailers should be an object of str to str")
+        if trailers and chunks is None:
+            raise ValueError("Endpoint response trailers require 'chunks'")
+
+        return cls(status=base.status, headers=base.headers, body=base.body,
+                   chunks=chunks, trailers=trailers)
+
+
+Ep = TypeVar("Ep", bound="Endpoint")
+
+
+class Endpoint(NamedTuple):
+    method: str
+    path: str
+    response: Optional[EndpointResponse]
+    mode: EndpointMode = EndpointMode.STATIC
+
+    @classmethod
+    def from_config(cls: Type[Ep], config: Dict[str, Any]) -> Ep:
+        method = config.get("method", "GET")
+        path = config.get("path", "/")
+
+        if not isinstance(method, str):
+            raise ValueError("Endpoint method should be a str")
+        if method.upper() not in HTTP_METHODS:
+            raise ValueError(f"Unknown endpoint method: {method}")
+        if not isinstance(path, str):
+            raise ValueError("Endpoint path should be a str")
+
+        method = method.upper()
+
+        mode = config.get("mode", EndpointMode.STATIC.value)
+        if not isinstance(mode, str):
+            raise ValueError("Endpoint mode should be a str")
+        if mode not in EndpointMode:
+            raise ValueError(f"Unknown endpoint mode: {mode}")
+        mode = EndpointMode(mode)
+
+        if mode is not EndpointMode.STATIC:
+            if "response" in config:
+                raise ValueError(
+                    f"An endpoint in '{mode}' mode takes no 'response'")
+            return cls(method=method, path=path, response=None, mode=mode)
+
+        response = EndpointResponse.from_config(config.get("response", ""))
+        return cls(method=method, path=path, response=response, mode=mode)
+
+
+Sv = TypeVar("Sv", bound="Server")
+
+
+class Server(NamedTuple):
+    # Exported to the guest as `HTTP_SERVER_<NAME>`, uppercased.
+    name: str
+    kind: ServerKind = ServerKind.LISTENING
+    endpoints: List[Endpoint] = []
+
+    @property
+    def env_var(self) -> str:
+        return f"HTTP_SERVER_{self.name.upper()}"
+
+    @classmethod
+    def from_config(cls: Type[Sv], config: Dict[str, Any]) -> Sv:
+        name = config.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Server name should be a non-empty str")
+        # The name becomes part of an environment variable, sent to the guest.
+        if not SERVER_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Server name should be alphanumeric or '_': {name}")
+
+        kind = config.get("kind", ServerKind.LISTENING.value)
+        if not isinstance(kind, str):
+            raise ValueError("Server kind should be a str")
+        if kind not in ServerKind:
+            raise ValueError(f"Unknown server kind: {kind}")
+        kind = ServerKind(kind)
+
+        # No endpoints should be defined in a closed server.
+        if kind is ServerKind.CLOSED:
+            if "endpoints" in config:
+                raise ValueError(
+                    "A server of kind 'closed' takes no 'endpoints'")
+            return cls(name=name, kind=kind, endpoints=[])
+
+        endpoints = config.get("endpoints", [])
+        if not isinstance(endpoints, list):
+            raise ValueError("Server endpoints should be a list")
+        return cls(name=name, kind=kind,
+                   endpoints=[Endpoint.from_config(ep) for ep in endpoints])
 
 
 K = TypeVar("K", bound="Kill")
@@ -290,6 +458,8 @@ class Config(NamedTuple):
     debug: bool = False
     # WASI world to target
     world: WasiWorld = WasiWorld.CLI_COMMAND
+    # HTTP servers stood up for outbound `wasi:http/client` requests.
+    servers: List[Server] = []
 
     @classmethod
     def from_file(cls: Type[T], config_file: str) -> T:
@@ -297,7 +467,9 @@ class Config(NamedTuple):
             dict_config = json.load(file)
 
         test_config_path = Path(config_file)
-        if dict_config.get("operations") is not None or dict_config.get("proposals") is not None:
+        if (dict_config.get("operations") is not None
+                or dict_config.get("proposals") is not None
+                or dict_config.get("servers") is not None):
             cls._validate_config(dict_config, CONFIG_KEYS)
 
             operations = []
@@ -308,6 +480,10 @@ class Config(NamedTuple):
             if dict_config.get("proposals") is not None:
                 proposals = cls._proposals_from_config(dict_config.get("proposals"))
 
+            servers = []
+            if dict_config.get("servers") is not None:
+                servers = cls._servers_from_config(dict_config.get("servers"))
+
             world = dict_config.get("world", WasiWorld.CLI_COMMAND.value)
             if world not in WasiWorld:
                 raise ValueError(f"Unknown WASI world: {world}")
@@ -315,7 +491,7 @@ class Config(NamedTuple):
             debug = bool(dict_config.get("debug"))
 
             return cls(operations=operations, proposals=proposals,
-                       world=WasiWorld(world), debug=debug)
+                       world=WasiWorld(world), debug=debug, servers=servers)
 
         cls._validate_config(dict_config, LEGACY_CONFIG_KEYS)
 
@@ -402,6 +578,15 @@ class Config(NamedTuple):
     @classmethod
     def _proposals_from_config(cls: Type[T], proposals: List[Any]) -> List[WasiProposal]:
         return [WasiProposal(p) for p in proposals]
+
+    @classmethod
+    def _servers_from_config(cls: Type[T], servers: List[Any]) -> List[Server]:
+        parsed = [Server.from_config(sv) for sv in servers]
+        names = [sv.name.upper() for sv in parsed]
+        duplicates = {name for name in names if names.count(name) > 1}
+        if duplicates:
+            raise ValueError(f"Duplicate server names: {sorted(duplicates)}")
+        return parsed
 
 
 class TestCase(NamedTuple):
